@@ -22,7 +22,7 @@ The proposed DRL framework improves resource utilization, reduces latency, and e
 - DDPG
 - DQN
 - 5G Network Slicing
-- 
+  
 ## Dataset Features
 - Packet Loss Rate (Reliability)
 - Packet Delay Budget (Latency)
@@ -31,7 +31,7 @@ The proposed DRL framework improves resource utilization, reduces latency, and e
 - UE Category
 - Technology Supported
 - Slice Type
-- 
+  
 ## Workflow
 1. Load and preprocess dataset
 2. Perform network slicing

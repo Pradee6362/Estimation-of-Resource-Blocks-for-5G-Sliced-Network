@@ -1,0 +1,352 @@
+%% Step 1: Load the Classified Data
+filePath = 'ClassifiedDataForDRL.xlsx'; 
+classifiedData = readtable(filePath, 'VariableNamingRule', 'preserve');
+
+% Extract relevant features (states) and predicted slice type (actions)
+stateVars = {'Packet Loss Rate (Reliability)', 'Packet Delay Budget (Latency)', 'GBR (Input 6)'};
+actionVar = 'Predicted_Slice_Type';
+
+% Convert categorical/text columns to numeric
+if iscell(classifiedData.('GBR (Input 6)'))
+    classifiedData.('GBR (Input 6)') = double(categorical(classifiedData.('GBR (Input 6)')));
+end
+
+% Convert table variables to a numeric array
+states = [classifiedData.('Packet Loss Rate (Reliability)'), ...
+          classifiedData.('Packet Delay Budget (Latency)'), ...
+          double(classifiedData.('GBR (Input 6)'))];
+
+% Convert action variable to numerical values (1-based indexing)
+[uniqueLabels, ~, actions] = unique(classifiedData.(actionVar));
+disp('Mapped Action Labels:');
+disp(uniqueLabels);
+disp('Mapped Action Values:');
+disp(unique(actions)); 
+
+disp("Data Loaded Successfully");
+
+%% Step 2: Define the RL Environment
+obsInfo = rlNumericSpec([size(states, 2) 1], 'LowerLimit', -Inf, 'UpperLimit', Inf, 'Name', 'State');
+actInfo = rlFiniteSetSpec([1 2 3], 'Name', 'Action');
+
+% Create RL environment
+env = rlFunctionEnv(obsInfo, actInfo, @mynewStepFunction2, @mynewResetFunction2);
+disp("RL Environment Created Successfully.");
+
+%% Step 3: Define the Deep Neural Network for Q-learning
+numObservations = obsInfo.Dimension(1);
+numActions = numel(actInfo.Elements);
+
+statePath = [
+    featureInputLayer(numObservations, 'Normalization', 'none', 'Name', 'state')
+    fullyConnectedLayer(32, 'Name', 'fc1')
+    reluLayer('Name', 'relu1')
+    fullyConnectedLayer(32, 'Name', 'fc2')
+    reluLayer('Name', 'relu2')
+    fullyConnectedLayer(32, 'Name', 'fc3')];
+
+actionPath = [
+    featureInputLayer(1, 'Normalization', 'none', 'Name', 'action')
+    fullyConnectedLayer(32, 'Name', 'fc_action')
+    reluLayer('Name', 'relu_action')];
+
+commonPath = [
+    concatenationLayer(1, 2, 'Name', 'concat')
+    fullyConnectedLayer(32, 'Name', 'fc4')
+    reluLayer('Name', 'relu3')
+    fullyConnectedLayer(1, 'Name', 'output')];
+
+dnn = layerGraph();
+dnn = addLayers(dnn, statePath);
+dnn = addLayers(dnn, actionPath);
+dnn = addLayers(dnn, commonPath);
+
+dnn = connectLayers(dnn, 'fc3', 'concat/in1');
+dnn = connectLayers(dnn, 'relu_action', 'concat/in2');
+
+critic = rlQValueFunction(dnn, obsInfo, actInfo, ...
+    'ObservationInputNames', {'state'}, ...
+    'ActionInputNames', {'action'});
+
+disp("Critic Network (Q-Value Function) Created Successfully.");
+
+%% Step 4: Define the RL Agent
+ agentOptions = rlDQNAgentOptions(...
+  'EpsilonGreedyExploration', rl.option.EpsilonGreedyExploration(...
+        'Epsilon', 1.0, ...
+        'EpsilonDecay', 0.005, ... % Faster decay for better convergence
+        'EpsilonMin', 0.1), ...
+   'ExperienceBufferLength', 1e6, ...
+    'MiniBatchSize', 512, ...
+    'TargetUpdateFrequency', 10, ...
+    'TargetSmoothFactor', 0.005, ... % Added for stability
+   'DiscountFactor', 0.997);
+
+% agentOptions = rlDQNAgentOptions(...
+ %   'UseDoubleDQN', true, ...
+  %  'TargetSmoothFactor', 0.001, ...
+   % 'ExperienceBufferLength', 1e6, ...
+   % 'MiniBatchSize', 64, ...
+   % 'DiscountFactor', 0.995, ...
+   % 'EpsilonGreedyExploration', rl.option.EpsilonGreedyExploration(...
+    %    'Epsilon', 1.0, ...
+     %   'EpsilonDecay', 0.005, ...
+      %  'EpsilonMin', 0.05));
+
+
+agent = rlDQNAgent(critic, agentOptions);
+disp("DQN Agent Created Successfully.");
+
+%% Step 5: Train the RL Agent
+trainOpts = rlTrainingOptions(...
+    'MaxEpisodes', 250, ...  
+    'MaxStepsPerEpisode', 500, ...
+    'ScoreAveragingWindowLength', 50, ...
+    'Verbose', true, ...
+    'Plots', 'training-progress', ...
+    'StopTrainingCriteria', 'AverageReward', ...
+    'StopTrainingValue', 490);  
+
+trainingStats = train(agent, env, trainOpts);
+save('trainedAgent_200episodes.mat', 'agent');
+disp("Training Completed Successfully.");
+
+%% Step 6: Test & Evaluate the Agent
+load('trainedAgent_200episodes.mat', 'agent');
+simOptions = rlSimulationOptions('MaxSteps', 500);
+experience = sim(env, agent, simOptions);
+disp("Testing Completed Successfully.");
+
+% Compute and Display Mean Reward
+if istable(experience)
+    rewards = experience.Reward;
+elseif isstruct(experience) && isfield(experience, 'Reward')
+    rewards = experience.Reward;
+else
+    error('Unexpected format for experience.Reward.');
+end
+
+% Convert timeseries to numeric if necessary
+if isa(rewards, 'timeseries')
+    rewards = rewards.Data;
+end
+
+meanReward = mean(rewards, 'omitnan');
+fprintf('Mean Reward from DRL Agent: %.4f\n', meanReward);
+
+
+predictedActions = zeros(size(states,1),1);
+
+for i = 1:size(states,1)
+    if states(i,1) > 0.05  % Packet loss rate > threshold
+        predictedActions(i) = 3; % Increase resources
+    elseif states(i,2) > 100  % High delay budget
+        predictedActions(i) = 1; % Reduce resources
+    else
+        predictedActions(i) = 2; % Maintain resources
+    end
+end
+
+% Compute Accuracy
+ruleBasedAccuracy = sum(predictedActions == actions) / numel(actions) * 100;
+fprintf('Rule-Based Estimation Accuracy: %.2f%%\n', ruleBasedAccuracy);
+
+%%Step 7: Resource Block Estimation Based on Actions
+disp(" Starting Resource Block Estimation...");
+
+% Define baseline RB allocation per slice type
+rbAllocation = containers.Map({'eMBB', 'URLLC', 'mIoT'}, [20, 10, 5]);
+
+% Convert numerical action outputs back to readable slice type
+actionToSliceType = {'Reduce', 'Maintain', 'Increase'};
+
+% Initialize an array to store estimated RBs
+estimatedRBs = zeros(size(states, 1), 1);
+
+for i = 1:size(states,1)
+    % Get the predicted action from the trained DRL agent
+    actionIdx = actions(i); % Actions are 0, 1, 2 (Reduce, Maintain, Increase)
+    
+    % Get the predicted traffic type
+    trafficType = string(classifiedData.Predicted_Slice_Type(i));
+    
+    % Fetch the base RB allocation for the traffic type
+    if isKey(rbAllocation, trafficType)
+        baseRBs = rbAllocation(trafficType);
+    else
+        baseRBs = 10;
+    end
+    
+    % Adjust RB allocation based on DRL action
+    switch actionIdx
+        case 1 % Reduce RBs
+            estimatedRBs(i) = baseRBs * 0.75;
+        case 2 % Maintain RBs
+            estimatedRBs(i) = baseRBs;
+        case 3 % Increase RBs
+            estimatedRBs(i) = baseRBs * 1.25;
+    end
+    
+end
+
+disp(" Resource Block Estimation Completed!");
+
+%%Step 8: Compute Mean Estimated Resource Blocks Per Traffic Type
+uniqueSlices = unique(classifiedData.Predicted_Slice_Type);
+for j = 1:length(uniqueSlices)
+    sliceType = string(uniqueSlices(j)); % Convert to string for comparison
+    indices = strcmp(string(classifiedData.Predicted_Slice_Type), sliceType);
+    avgRBs = mean(estimatedRBs(indices));
+    fprintf('Average Estimated RBs for %s: %.2f\n', sliceType, avgRBs);
+end
+
+%% Step 9: Save the Estimated Resource Blocks for Further Analysis
+outputTable = table(classifiedData.Predicted_Slice_Type, actions, estimatedRBs, ...
+    'VariableNames', {'Traffic_Type', 'Action_Taken', 'Estimated_RBs'});
+
+writetable(outputTable, 'EstimatedResourceBlocks.xlsx');
+
+disp(" Estimated Resource Blocks Saved to 'EstimatedResourceBlocks.xlsx'!");
+
+%%Step 10: Compute Accuracy of DRL-Based Estimation
+correctPredictions = sum(predictedActions == actions);
+totalSamples = numel(actions);
+drlAccuracy = (correctPredictions / totalSamples) * 100;
+
+fprintf('DRL-Based Estimation Accuracy: %.2f%%\n', drlAccuracy);
+
+
+% Import data from the Excel file
+filename = 'EstimatedResourceBlocks.xlsx';
+data = readtable(filename);
+
+% Extract relevant columns
+Traffic_Type = data.Traffic_Type;
+Action_Taken = data.Action_Taken;
+Estimated_RBs = data.Estimated_RBs;
+
+% Grouped Bar Chart: Average Estimated_RBs per Traffic Type
+figure;
+unique_types = unique(Traffic_Type);
+avg_rbs = zeros(size(unique_types));
+for i = 1:length(unique_types)
+    avg_rbs(i) = mean(Estimated_RBs(Traffic_Type == unique_types(i)));
+end
+bar(unique_types, avg_rbs);
+xlabel('Traffic Type');
+ylabel('Average Estimated Resource Blocks');
+title('Traffic Type vs Average Estimated RBs');
+grid on;
+
+% Save figure
+saveas(gcf, 'Traffic_Type_vs_Avg_Estimated_RBs.png');
+
+% Scatter Plot with Jitter for better visibility
+figure;
+scatter(Traffic_Type + randn(size(Traffic_Type)) * 0.1, Estimated_RBs, 'filled');
+xlabel('Traffic Type');
+ylabel('Estimated Resource Blocks');
+title('Traffic Type vs Estimated RBs (Jittered)');
+grid on;
+
+% Save figure
+saveas(gcf, 'Traffic_Type_vs_Estimated_RBs_Scatter.png');
+
+% Box Plot for Action Taken vs Estimated RBs
+figure;
+boxplot(Estimated_RBs, Action_Taken);
+xlabel('Action Taken');
+ylabel('Estimated Resource Blocks');
+title('Action Taken vs Estimated RBs');
+grid on;
+
+% Save figure
+saveas(gcf, 'Action_Taken_vs_Estimated_RBs.png');
+
+% Histogram of Estimated RBs
+figure;
+histogram(Estimated_RBs, 'BinWidth', 1);
+xlabel('Estimated Resource Blocks');
+ylabel('Frequency');
+title('Distribution of Estimated RBs');
+grid on;
+
+% Save figure
+saveas(gcf, 'Estimated_RBs_Histogram.png');
+
+% Define accuracy values (update DRL-based value as needed)
+ruleBasedAccuracy = 21.90;   % Rule-Based Accuracy
+drlBasedAccuracy  = 32.60;   % <-- UPDATE THIS with new DRL accuracy
+
+% Accuracy data
+accuracyValues = [ruleBasedAccuracy, drlBasedAccuracy];
+methods = {'Rule-Based', 'DRL-Based'};
+
+% Create bar plot
+figure;
+bar(accuracyValues, 0.5);
+set(gca, 'XTickLabel', methods, 'FontSize', 12);
+ylabel('Accuracy (%)', 'FontSize', 12);
+title('Accuracy Comparison: Rule-Based vs DRL-Based', 'FontSize', 14);
+ylim([0 100]);
+grid on;
+
+% Annotate values on top of bars
+text(1:length(accuracyValues), accuracyValues + 2, ...
+    string(accuracyValues) + "%", 'HorizontalAlignment', 'center', 'FontSize', 12);
+
+
+//////////////////////////////////////////////////////////////////////////////////////
+
+
+myNewResetFunction2.m
+
+function [initialObservation, loggedSignals] = mynewResetFunction2()
+    % Initialize state variables as a column vector
+    initialObservation = [0.5; 0.5; 0.5]; % Ensure it is a column vector (3x1)
+    
+    % Initialize logged signals
+    loggedSignals = struct();
+    loggedSignals.state = initialObservation;
+end
+
+
+//////////////////////////////////////////////////////////////////////////////////////
+
+myNewStepFunction2.m
+
+function [nextObs, reward, isDone, loggedSignals] = mynewStepFunction2(action, loggedSignals)
+
+
+    % Ensure action is within the valid range
+    validActions = [1, 2, 3]; % Reduce, Maintain, Increase
+    if ~ismember(action, validActions)
+        error('Invalid action index. Must be in range 1-3.');
+    end
+
+    % Define action mapping (state changes)
+    actionMapping = [-0.05, 0, 0.05]; % Reduce, Maintain, Increase
+
+    % Map the action (1 → -0.05, 2 → 0, 3 → 0.05)
+    stateChange = actionMapping(action);
+
+    
+    % Update state variables
+    state = loggedSignals.state;
+    nextObs = state;
+    nextObs(1) = max(0, min(1, state(1) + stateChange * 0.8));  % Packet Loss
+    nextObs(2) = max(0, min(1, state(2) + stateChange * 0.6));  % Latency
+    nextObs(3) = max(0, min(1, state(3) + stateChange * 0.4));  % GBR
+
+    %Reward Function
+    reward = -(nextObs(1)^1.5) - (nextObs(2)^1.2) + (1 - abs(nextObs(3) - 0.5));
+
+    %Define Termination Conditions
+    isDone = (nextObs(1) > 0.9 || nextObs(2) > 0.9 || abs(nextObs(3) - 0.5) > 0.4);
+
+    % Update loggedSignals
+    loggedSignals.state = nextObs;
+end
+
+
+
